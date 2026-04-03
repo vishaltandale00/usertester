@@ -1,0 +1,5 @@
+[
+  { "message": "Sign up as a new user and complete the full onboarding flow" },
+  { "message": "Sign up, then try to upgrade to the paid plan" },
+  { "message": "Sign up using Google OAuth if available, otherwise use the email form" }
+]
