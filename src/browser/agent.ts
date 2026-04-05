@@ -7,12 +7,14 @@
  *   exportMemory() → SessionMemory
  *   destroy() → void
  */
-import Anthropic from '@anthropic-ai/sdk'
 import { Stagehand } from '@browserbasehq/stagehand'
 import path from 'node:path'
 import fs from 'node:fs'
-import type { ActionRecord, SessionMemory, ProfileFacts } from '../types.js'
+import type { ActionRecord, SessionMemory, ProfileFacts, UsertesterConfig, RecoveryTip } from '../types.js'
 import { appendAgentEvent, appendAgentLog } from '../output/events.js'
+import { cheapCall, cheapBatch } from '../llm/provider.js'
+import { classifyFailure, selectToolsForRecovery, buildRetryInstruction } from '../orchestrator/retry.js'
+import type { RetryAttempt } from '../orchestrator/retry.js'
 
 export interface ResumeResult {
   summary: string
@@ -22,9 +24,10 @@ export interface ResumeResult {
 const ARCHIVE_THRESHOLD = 50
 const ARCHIVE_BATCH = 10
 
+
 export class BrowserAgent {
   private stagehand: Stagehand | null = null
-  private anthropic: Anthropic
+  private config: Partial<UsertesterConfig>
   private memory: SessionMemory
   private agentDir: string
   private screenshotIndex = 0
@@ -32,12 +35,12 @@ export class BrowserAgent {
   private rlmMaxFailedActions: number
 
   constructor(opts: {
-    anthropicApiKey: string
+    config: Partial<UsertesterConfig>
     agentDir: string
     rlmRecentActions?: number
     rlmMaxFailedActions?: number
   }) {
-    this.anthropic = new Anthropic({ apiKey: opts.anthropicApiKey })
+    this.config = opts.config
     this.agentDir = opts.agentDir
     this.rlmRecentActions = opts.rlmRecentActions ?? 10
     this.rlmMaxFailedActions = opts.rlmMaxFailedActions ?? 5
@@ -46,6 +49,7 @@ export class BrowserAgent {
       startUrl: '',
       actions: [],
       archivedActionCount: 0,
+      recoveryTips: [],
     }
   }
 
@@ -58,30 +62,55 @@ export class BrowserAgent {
     this.memory.taskDescription = initialTask
     this.memory.startUrl = url
 
+    // Use Stagehand's native model config (provider/model format + apiKey)
+    // This is the format confirmed working from spike tests
+    const cuaModelString = this.config.cua_model ?? 'anthropic/claude-opus-4-6'
+    // Strip 'openrouter/' prefix — Stagehand uses provider/model directly
+    const stagehandModelName = cuaModelString.startsWith('openrouter/')
+      ? cuaModelString.slice('openrouter/'.length)
+      : cuaModelString
+
+    const apiKey = this.config.anthropic_api_key
+      ?? this.config.openrouter_api_key
+      ?? this.config.openai_api_key
+      ?? process.env.ANTHROPIC_API_KEY
+      ?? process.env.OPENROUTER_API_KEY
+      ?? ''
+
     this.stagehand = new Stagehand({
       env: 'LOCAL',
       verbose: 0,
-      model: {
-        modelName: 'anthropic/claude-opus-4-6',
-        apiKey: this.anthropic.apiKey as string,
-      },
+      model: { modelName: stagehandModelName, apiKey } as any,
       localBrowserLaunchOptions: { headless: true },
-      logger: () => {},  // suppress internal logs
+      logger: () => {},
+      experimental: true,
+      disableAPI: true,
     })
 
     await this.stagehand.init()
     const page = this.stagehand.context.pages()[0]
+
+    // Inject identity header on all requests so customers can allowlist in Cloudflare WAF:
+    //   (http.request.headers["x-usertester-session"] eq "1") → Skip → Bot Fight Mode
+    await page.setExtraHTTPHeaders({ 'x-usertester-session': '1' })
 
     appendAgentLog(this.agentDir, `Browser started. Navigating to ${url}`)
     appendAgentEvent(this.agentDir, { event: 'browser_started', url })
 
     await page.goto(url, { waitUntil: 'load' })
 
-    // Build initial system context including profile hints
-    const hintLines = profileHints?.harnessHints
-      .filter(h => h.confidence > 0.5)
-      .map(h => `- ${h.observation}`)
-      .join('\n')
+    // Build initial system context including profile hints.
+    // If a high-confidence recovery tip exists (proven approach), use it exclusively —
+    // contradictory lower-confidence hints are excluded to avoid confusing the agent.
+    const provenApproach = profileHints?.harnessHints.find(
+      h => h.confidence >= 0.95 && h.observation.startsWith('PROVEN APPROACH'),
+    )
+    const hintLines = provenApproach
+      ? `- ${provenApproach.observation}`
+      : profileHints?.harnessHints
+          .filter(h => h.confidence > 0.5)
+          .map(h => `- ${h.observation}`)
+          .join('\n')
 
     const systemContext = [
       `You are testing this web app as a first-time user.`,
@@ -96,7 +125,60 @@ export class BrowserAgent {
 
     appendAgentLog(this.agentDir, `Starting task: ${initialTask}`)
 
-    await this.executeTask(systemContext, initialTask)
+    let result = await this.executeTask(systemContext, initialTask)
+    const retryHistory: RetryAttempt[] = []
+
+    if (!result.completed) {
+      for (let attempt = 2; attempt <= 5; attempt++) {
+        const classification = await classifyFailure(result.message, this.config)
+        appendAgentLog(this.agentDir, `Retry ${attempt}: classified as ${classification.type} — ${classification.recoveryHint}`)
+
+        retryHistory.push({
+          attempt: attempt - 1,
+          instruction: initialTask,
+          toolsInjected: [],
+          result: 'failed',
+          failureType: classification.type,
+          agentMessage: result.message,
+          finalUrl: result.finalUrl,
+        })
+
+        if (classification.type === 'COMPLETE') break
+        if (classification.type === 'ESCALATE') break
+        // ENVIRONMENT_BLOCK: only break if no solver tool available for it
+        if (classification.type === 'ENVIRONMENT_BLOCK') {
+          const recoveryTools = selectToolsForRecovery(classification)
+          if (Object.keys(recoveryTools).length === 0) break  // no tool can help
+        }
+        if (classification.type === 'TRANSIENT' && attempt > 3) break
+
+        const tools = selectToolsForRecovery(classification)
+        const retryInstruction = buildRetryInstruction(initialTask, retryHistory, this.memory, url)
+
+        appendAgentLog(this.agentDir, `  injecting tools: ${Object.keys(tools).join(', ') || 'none'}`)
+        result = await this.executeTask(systemContext, retryInstruction, tools)
+
+        if (result.completed) {
+          appendAgentLog(this.agentDir, `✓ Retry ${attempt} succeeded`)
+          const tip: RecoveryTip = {
+            url: this.memory.startUrl,
+            scenario: 'signup',
+            failedApproaches: retryHistory
+              .filter(a => a.result === 'failed')
+              .map(a => a.agentMessage.slice(0, 150)),
+            successApproach: result.message.slice(0, 400),
+            toolsUsed: Object.keys(tools),
+            finalUrl: result.finalUrl,
+            confidence: 0.95,
+            ts: Date.now(),
+          }
+          this.memory.recoveryTips.push(tip)
+          appendAgentEvent(this.agentDir, { event: 'recovery_tip_written', tip })
+          appendAgentLog(this.agentDir, `Recovery tip stored: ${tip.successApproach.slice(0, 80)}`)
+          break
+        }
+      }
+    }
   }
 
   async resume(task: string): Promise<ResumeResult> {
@@ -106,7 +188,7 @@ export class BrowserAgent {
     appendAgentLog(this.agentDir, `Resuming with task: ${task}`)
     appendAgentLog(this.agentDir, `RLM context: ${context.slice(0, 200)}...`)
 
-    await this.executeTask(context, task)
+    await this.executeTask(context, task, {})
 
     const screenshotPath = await this.takeScreenshot()
     const summary = await this.summarizeLastTask(task)
@@ -162,74 +244,74 @@ export class BrowserAgent {
   private async llmBatch(
     queries: Array<{ data: ActionRecord[]; prompt: string }>,
   ): Promise<string[]> {
-    return Promise.all(
-      queries.map(async ({ data, prompt }) => {
-        if (data.length === 0) return '(no data)'
-        const dataStr = data
-          .map(a => `${a.action} → ${a.result}${a.observation ? ` | ${a.observation}` : ''}`)
-          .join('\n')
+    const prompts = queries.map(({ data, prompt }) => {
+      if (data.length === 0) return null
+      const dataStr = data
+        .map(a => `${a.action} → ${a.result}${a.observation ? ` | ${a.observation}` : ''}`)
+        .join('\n')
+      return `${prompt}\n\nActions:\n${dataStr}\n\nAnswer in 1-2 sentences.`
+    })
 
-        const response = await this.anthropic.messages.create({
-          model: 'claude-haiku-4-5-20251001',
-          max_tokens: 150,
-          messages: [
-            {
-              role: 'user',
-              content: `${prompt}\n\nActions:\n${dataStr}\n\nAnswer in 1-2 sentences.`,
-            },
-          ],
-        })
-        const block = response.content[0]
-        return block.type === 'text' ? block.text : '(no text)'
+    return Promise.all(
+      prompts.map(async (p) => {
+        if (p === null) return '(no data)'
+        const text = await cheapBatch([p], this.config, 150)
+        return text[0] || '(no data)'
       }),
     )
   }
 
   // --- Private: task execution ---
 
-  private async executeTask(systemContext: string, task: string): Promise<void> {
+  private async executeTask(
+    systemContext: string,
+    task: string,
+    tools: Record<string, unknown> = {},
+  ): Promise<{ completed: boolean; message: string; finalUrl: string }> {
     if (!this.stagehand) throw new Error('Stagehand not initialized')
 
     const page = this.stagehand.context.pages()[0]
     const startUrl = page.url()
-
-    // Use stagehand.agent().execute() for multi-step tasks.
-    // act() is single-step only — it executes one action and considers itself done.
-    // agent().execute() runs a proper loop: observe → act → check → repeat until complete.
-    const fullInstruction = systemContext
-      ? `${systemContext}\n\nTask: ${task}`
-      : task
+    const fullInstruction = systemContext ? `${systemContext}\n\nTask: ${task}` : task
 
     try {
-      const agent = this.stagehand.agent()
+      // Tools are passed to stagehand.agent() config, not to execute()
+      const agentConfig: Record<string, unknown> = {}
+      if (Object.keys(tools).length > 0) {
+        agentConfig.tools = tools
+      }
+      const agent = this.stagehand.agent(agentConfig as Parameters<typeof this.stagehand.agent>[0])
       const result = await agent.execute({ instruction: fullInstruction, maxSteps: 15 })
 
       await page.waitForLoadState('load').catch(() => {})
       const newUrl = page.url()
 
       appendAgentLog(this.agentDir, `agent.execute() completed: ${result.completed ? 'done' : 'incomplete'}`)
-      appendAgentLog(this.agentDir, `  steps taken: ${result.actions?.length ?? 0}`)
+      appendAgentLog(this.agentDir, `  steps: ${result.actions?.length ?? 0}, tools injected: ${Object.keys(tools).join(', ') || 'none'}`)
+      appendAgentLog(this.agentDir, `  message: ${result.message}`)
+      appendAgentLog(this.agentDir, `  final url: ${newUrl}`)
 
       // Record each step as an ActionRecord for RLM memory
       for (const action of (result.actions ?? [])) {
         this.recordAction({
           ts: Date.now(),
-          action: action.type ?? 'unknown',
+          action: (action as any).type ?? 'unknown',
           result: 'success',
+          observation: (action as any).reasoning ?? undefined,
           url: startUrl,
         })
       }
 
-      // Also record overall outcome
-      if ((result.actions?.length ?? 0) === 0) {
-        this.recordAction({
-          ts: Date.now(),
-          action: task.slice(0, 100),
-          result: result.completed ? 'success' : 'failed',
-          observation: newUrl !== startUrl ? `Navigated to ${newUrl}` : `Stayed on ${startUrl}`,
-          url: startUrl,
-        })
-      }
+      // Record overall outcome with agent's message as observation
+      this.recordAction({
+        ts: Date.now(),
+        action: task.slice(0, 100),
+        result: result.completed ? 'success' : 'failed',
+        observation: result.message ?? (newUrl !== startUrl ? `Navigated to ${newUrl}` : `Stayed on ${startUrl}`),
+        url: startUrl,
+      })
+
+      return { completed: result.completed, message: result.message ?? '', finalUrl: newUrl }
     } catch (err) {
       appendAgentLog(this.agentDir, `agent.execute() failed: ${err}`)
 
@@ -250,7 +332,7 @@ export class BrowserAgent {
               result: 'success',
               url: startUrl,
             })
-            appendAgentLog(this.agentDir, `  ✓ ${action.description}`)
+            appendAgentLog(this.agentDir, `  ok ${action.description}`)
           } catch (err2) {
             this.recordAction({
               ts: Date.now(),
@@ -260,7 +342,7 @@ export class BrowserAgent {
               observation: String(err2),
               url: startUrl,
             })
-            appendAgentLog(this.agentDir, `  ✗ ${action.description}: ${err2}`)
+            appendAgentLog(this.agentDir, `  fail ${action.description}: ${err2}`)
           }
         }
       } else {
@@ -272,6 +354,8 @@ export class BrowserAgent {
           url: startUrl,
         })
       }
+
+      return { completed: false, message: String(err), finalUrl: page.url() }
     }
   }
 
@@ -318,19 +402,11 @@ export class BrowserAgent {
       .map(a => `${a.action} → ${a.result}${a.observation ? ` (${a.observation})` : ''}`)
       .join('\n')
 
+    const prompt = `Task: "${task}"\n\nActions taken:\n${actionsStr}\n\nSummarize in 1-2 sentences: what happened, did the task complete, and anything confusing or broken?`
+
     try {
-      const response = await this.anthropic.messages.create({
-        model: 'claude-haiku-4-5-20251001',
-        max_tokens: 200,
-        messages: [
-          {
-            role: 'user',
-            content: `Task: "${task}"\n\nActions taken:\n${actionsStr}\n\nSummarize in 1-2 sentences: what happened, did the task complete, and anything confusing or broken?`,
-          },
-        ],
-      })
-      const block = response.content[0]
-      return block.type === 'text' ? block.text : 'Task execution complete.'
+      const text = await cheapCall(prompt, this.config, 200)
+      return text || 'Task execution complete.'
     } catch {
       return `Completed ${recentActions.filter(a => a.result === 'success').length}/${recentActions.length} actions.`
     }

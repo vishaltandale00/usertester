@@ -108,6 +108,44 @@ If the file has fewer entries than `--n`, tasks cycle.
 
 ---
 
+## Bypassing bot detection (Cloudflare, CAPTCHA)
+
+usertester injects an `x-usertester-session: 1` header on every request. Configure your app to allow this traffic through.
+
+### Option A: Cloudflare WAF bypass (recommended, free)
+
+In Cloudflare dashboard → **Security → WAF → Custom rules → Create rule**:
+
+```
+Field:      Request Header
+Header:     x-usertester-session
+Operator:   equals
+Value:      1
+Action:     Skip → All remaining custom rules
+```
+
+This bypasses Turnstile and Bot Fight Mode for usertester traffic only. Takes 2 minutes.
+
+### Option B: Supabase Auth — use Cloudflare test keys
+
+If your app uses Supabase Auth with Cloudflare Turnstile:
+
+1. Supabase dashboard → **Authentication → Security → CAPTCHA protection**
+2. Switch site key to: `1x00000000000000000000AA` (Cloudflare's official test key — always passes)
+3. Switch secret key to: `1x0000000000000000000000000000000AA`
+
+Use only in dev/staging — not production.
+
+### Option C: Automatic CAPTCHA solving (no app changes, paid)
+
+Add `CAPSOLVER_API_KEY` to `.env` and usertester will automatically solve Cloudflare Turnstile via [CapSolver](https://capsolver.com) (~$1.20/1K solves, ~85-90% success rate).
+
+```bash
+CAPSOLVER_API_KEY=CAP-...
+```
+
+---
+
 ## Calling from a coding agent
 
 usertester is designed to be orchestrated by a coding agent (Claude Code, Codex) as well as used directly. Parse the NDJSON stream:

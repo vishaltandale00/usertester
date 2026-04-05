@@ -14,6 +14,7 @@ import path from 'node:path'
 import fs from 'node:fs'
 import type { AgentStatus, SessionState, UsertesterConfig } from '../types.js'
 import { BrowserAgent } from '../browser/agent.js'
+import { cheapCall } from '../llm/provider.js'
 import { InboxManager } from '../inbox/agentmail.js'
 import {
   emitEvent,
@@ -24,7 +25,7 @@ import {
   readPendingCommand,
 } from '../output/events.js'
 import { saveSession, transitionAgent } from './session.js'
-import { loadProfile, updateProfile } from '../profiles/learner.js'
+import { loadProfile, updateProfile, updateProfileWithSuccess } from '../profiles/learner.js'
 
 const COMMAND_POLL_MS = 500
 const MAX_RETRIES = 3
@@ -90,7 +91,7 @@ export async function runAgent(opts: {
   transition('SIGNING_UP', { currentMessage: initialMessage, startedAt: Date.now() })
 
   const browserAgent = new BrowserAgent({
-    anthropicApiKey: config.anthropic_api_key!,
+    config,
     agentDir,
     rlmRecentActions: config.rlm_recent_actions,
     rlmMaxFailedActions: config.rlm_max_failed_actions,
@@ -127,7 +128,7 @@ export async function runAgent(opts: {
   }
 
   // Initial task done — emit ready + go to WAITING
-  const summary = await generateSummary(browserAgent, initialMessage, config.anthropic_api_key!)
+  const summary = await generateSummary(browserAgent, initialMessage, config)
   const screenshotPath = path.join(agentDir, 'screenshots', '001.png')
 
   emitEvent({
@@ -141,8 +142,16 @@ export async function runAgent(opts: {
 
   transition('WAITING')
 
-  // Update profile with what we learned
-  updateProfile(config.results_dir, url, 'signup', browserAgent.exportMemory()).catch(() => {})
+  // Update profile — recovery tip takes priority over LLM-based failure extraction
+  const memory = browserAgent.exportMemory()
+  if (memory.recoveryTips.length > 0) {
+    // Success path: write recovery tip + run MemCollab intersection (no LLM needed)
+    const latestTip = memory.recoveryTips[memory.recoveryTips.length - 1]
+    updateProfileWithSuccess(config.results_dir, latestTip).catch(() => {})
+  } else {
+    // Failure path: use LLM to extract hints from failure trace
+    updateProfile(config.results_dir, url, 'signup', memory).catch(() => {})
+  }
 
   // --- WAITING: poll for commands ---
   const commandsPath = path.join(agentDir, 'commands.ndjson')
@@ -203,10 +212,8 @@ export async function runAgent(opts: {
 async function generateSummary(
   agent: BrowserAgent,
   task: string,
-  apiKey: string,
+  config: UsertesterConfig,
 ): Promise<string> {
-  const Anthropic = await import('@anthropic-ai/sdk').then(m => m.default)
-  const client = new Anthropic({ apiKey })
   const memory = agent.exportMemory()
   const recentActions = memory.actions.slice(-10)
 
@@ -217,18 +224,12 @@ async function generateSummary(
     .join('\n')
 
   try {
-    const response = await client.messages.create({
-      model: 'claude-haiku-4-5-20251001',
-      max_tokens: 200,
-      messages: [
-        {
-          role: 'user',
-          content: `Task: "${task}"\n\nActions:\n${actionsStr}\n\nSummarize in 1-2 sentences: what happened, did the task complete, anything confusing or broken?`,
-        },
-      ],
-    })
-    const block = response.content[0]
-    return block.type === 'text' ? block.text : 'Task execution complete.'
+    const text = await cheapCall(
+      `Task: "${task}"\n\nActions:\n${actionsStr}\n\nSummarize in 1-2 sentences: what happened, did the task complete, anything confusing or broken?`,
+      config,
+      200,
+    )
+    return text || 'Task execution complete.'
   } catch {
     return `Completed ${recentActions.filter(a => a.result === 'success').length}/${recentActions.length} steps.`
   }

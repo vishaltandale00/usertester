@@ -46,11 +46,23 @@ export interface ActionRecord {
   url?: string
 }
 
+export interface RecoveryTip {
+  url: string
+  scenario: string                // e.g. "signup"
+  failedApproaches: string[]      // summaries of what failed (1 per attempt)
+  successApproach: string         // what the agent reported on the successful attempt
+  toolsUsed: string[]             // tools that were active on success
+  finalUrl: string                // confirms we got past the auth wall
+  confidence: number              // always 0.95 for a direct observation
+  ts: number
+}
+
 export interface SessionMemory {
   taskDescription: string
   startUrl: string
   actions: ActionRecord[]
   archivedActionCount: number
+  recoveryTips: RecoveryTip[]
 }
 
 // --- Profile meta-learning ---
@@ -92,6 +104,8 @@ export interface AgentCommand {
 export interface UsertesterConfig {
   agentmail_api_key?: string
   anthropic_api_key?: string
+  openrouter_api_key?: string
+  openai_api_key?: string
   cua_backend: 'stagehand'
   max_agents: number
   cua_concurrency_limit: number
@@ -100,11 +114,16 @@ export interface UsertesterConfig {
   results_dir: string
   rlm_recent_actions: number
   rlm_max_failed_actions: number
+  orchestrator_model: string   // cheap model: summaries, RLM, classifier
+  cua_model: string            // browser execution (Stagehand)
+  proposer_model: string       // outer harness loop
 }
 
 export const DEFAULT_CONFIG: UsertesterConfig = {
   agentmail_api_key: process.env.AGENTMAIL_API_KEY,
   anthropic_api_key: process.env.ANTHROPIC_API_KEY,
+  openrouter_api_key: process.env.OPENROUTER_API_KEY,
+  openai_api_key: process.env.OPENAI_API_KEY,
   cua_backend: 'stagehand',
   max_agents: 20,
   cua_concurrency_limit: 5,
@@ -113,4 +132,13 @@ export const DEFAULT_CONFIG: UsertesterConfig = {
   results_dir: `${process.env.HOME}/.usertester`,
   rlm_recent_actions: 10,
   rlm_max_failed_actions: 5,
+  orchestrator_model: process.env.OPENROUTER_API_KEY
+    ? 'openrouter/openai/gpt-5.4-mini'
+    : 'anthropic/claude-haiku-4-5-20251001',
+  cua_model: process.env.OPENROUTER_API_KEY
+    ? 'openrouter/anthropic/claude-opus-4-6'
+    : 'anthropic/claude-opus-4-6',
+  proposer_model: process.env.OPENROUTER_API_KEY
+    ? 'openrouter/anthropic/claude-opus-4-6'
+    : 'anthropic/claude-opus-4-6',
 }
