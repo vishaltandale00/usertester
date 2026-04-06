@@ -2,10 +2,13 @@
  * Orchestrator: manages N agents, concurrency queue, session lifecycle
  */
 import crypto from 'node:crypto'
+import path from 'node:path'
 import type { SessionState, UsertesterConfig } from '../types.js'
 import { emitEvent, ts, initSessionDirs } from '../output/events.js'
 import { createSession, saveSession, transitionAgent } from './session.js'
 import { runAgent } from './agent.js'
+import type { RetryAttempt } from './retry.js'
+import { runHarnessLoop } from '../harness/index.js'
 
 export async function orchestrate(opts: {
   url: string
@@ -35,6 +38,9 @@ export async function orchestrate(opts: {
 
   // Concurrency queue
   const agentPromises: Promise<void>[] = []
+  // Collect per-agent results for the harness loop
+  const agentResults: Array<{ retryHistory: RetryAttempt[]; toolsUsed: string[]; profileHit: boolean } | null> =
+    new Array(agentIds.length).fill(null)
   const concurrencyLimit = Math.min(config.cua_concurrency_limit, n)
   let activeCount = 0
   let agentIndex = 0
@@ -59,6 +65,9 @@ export async function orchestrate(opts: {
           onStateChange,
           getState,
         })
+          .then(result => {
+            agentResults[currentIndex] = result
+          })
           .catch(err => {
             const newState = transitionAgent(getState(), agentId, 'FAILED', { error: String(err) })
             onStateChange(newState)
@@ -84,5 +93,22 @@ export async function orchestrate(opts: {
   })
 
   await Promise.allSettled(agentPromises)
+
+  // Outer loop: fire-and-forget harness improvement
+  const harnessDir = path.join(config.results_dir, 'harness')
+  const agentSucceeded = state.agents.map(a => ['DONE', 'WAITING'].includes(a.status))
+  runHarnessLoop({
+    sessionId,
+    agentRetryHistories: agentResults.map(r => r?.retryHistory ?? []),
+    agentToolsUsed: agentResults.map(r => r?.toolsUsed ?? []),
+    agentProfileHits: agentResults.map(r => r?.profileHit ?? false),
+    agentSucceeded,
+    url,
+    nAgents: n,
+    config,
+    harnessDir,
+    projectRoot: new URL('../..', import.meta.url).pathname,
+  }).catch(() => {})  // never throw — outer loop is non-fatal
+
   emitEvent({ event: 'session_complete', sessionId, ts: ts() })
 }

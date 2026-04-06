@@ -18,6 +18,7 @@ import type { UsertesterConfig, RecoveryTip } from '../types.js'
 export type FailureType =
   | 'COMPLETE'
   | 'TRANSIENT'
+  | 'RATE_LIMITED'
   | 'WRONG_APPROACH'
   | 'CAPABILITY_GAP'
   | 'ENVIRONMENT_BLOCK'
@@ -42,7 +43,7 @@ export interface RetryAttempt {
 export const MAX_ATTEMPTS = 5
 
 // Signal patterns that map to failure types
-const FAILURE_SIGNALS: Array<{ pattern: RegExp; type: FailureType; hint: string }> = [
+export const FAILURE_SIGNALS: Array<{ pattern: RegExp; type: FailureType; hint: string }> = [
   {
     pattern: /DNS|ERR_NAME_NOT_RESOLVED|net::ERR|could not resolve|unreachable/i,
     type: 'WRONG_APPROACH',
@@ -54,9 +55,14 @@ const FAILURE_SIGNALS: Array<{ pattern: RegExp; type: FailureType; hint: string 
     hint: 'Use the readInboxEmail tool to retrieve the verification code from the email inbox.',
   },
   {
-    pattern: /timeout|rate limit|429|503|temporarily/i,
+    pattern: /only request this after (\d+)|too many requests|rate.?limit|429|resend.*after/i,
+    type: 'RATE_LIMITED',
+    hint: 'Rate limited — wait the specified cooldown period before retrying.',
+  },
+  {
+    pattern: /timeout|503|temporarily unavailable|connection failed/i,
     type: 'TRANSIENT',
-    hint: 'Transient error — retry the same approach.',
+    hint: 'Transient error — retry the same approach after a short wait.',
   },
   {
     pattern: /captcha|CAPTCHA|bot detection|unusual traffic/i,
@@ -149,6 +155,8 @@ export function buildRetryInstruction(
     })
     if (tip) {
       return [
+        `App URL: ${currentUrl} — navigate here if the page is blank or shows an error.`,
+        ``,
         `PROVEN APPROACH FOR THIS APP:`,
         `The following approach previously succeeded (tools: ${tip.toolsUsed.join(', ') || 'none'}):`,
         `"${tip.successApproach}"`,
@@ -173,8 +181,12 @@ export function buildRetryInstruction(
     ? '\n\nIMPORTANT: You have a readInboxEmail tool available. Use it to read any verification emails — do NOT try to navigate to a web-based inbox.'
     : ''
 
+  // Always pin the URL so the agent never guesses if navigation fails
+  const urlPin = currentUrl ? `\nApp URL: ${currentUrl} — always navigate here first if the page is blank or shows an error.` : ''
+
   return [
     originalInstruction,
+    urlPin,
     '',
     '--- Previous attempt context ---',
     ...constraints,

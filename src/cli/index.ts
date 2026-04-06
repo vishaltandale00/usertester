@@ -12,6 +12,7 @@ import { registerKill } from './kill.js'
 import { registerLogs } from './logs.js'
 import { registerCleanup } from './cleanup.js'
 import { registerProfiles } from './profiles.js'
+import { registerHarness } from './harness.js'
 
 const program = new Command()
 
@@ -28,5 +29,6 @@ registerKill(program)
 registerLogs(program)
 registerCleanup(program)
 registerProfiles(program)
+registerHarness(program)
 
 program.parse()

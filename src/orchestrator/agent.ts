@@ -14,6 +14,7 @@ import path from 'node:path'
 import fs from 'node:fs'
 import type { AgentStatus, SessionState, UsertesterConfig } from '../types.js'
 import { BrowserAgent } from '../browser/agent.js'
+import type { RetryAttempt } from '../orchestrator/retry.js'
 import { cheapCall } from '../llm/provider.js'
 import { InboxManager } from '../inbox/agentmail.js'
 import {
@@ -30,6 +31,12 @@ import { loadProfile, updateProfile, updateProfileWithSuccess } from '../profile
 const COMMAND_POLL_MS = 500
 const MAX_RETRIES = 3
 
+export interface AgentResult {
+  retryHistory: RetryAttempt[]
+  toolsUsed: string[]
+  profileHit: boolean
+}
+
 export async function runAgent(opts: {
   agentId: string
   sessionId: string
@@ -39,7 +46,7 @@ export async function runAgent(opts: {
   state: SessionState
   onStateChange: (newState: SessionState) => void
   getState: () => SessionState
-}): Promise<void> {
+}): Promise<AgentResult> {
   const { agentId, sessionId, url, initialMessage, config } = opts
   const sessionDir = path.join(config.results_dir, sessionId)
   const agentDir = getAgentDir(sessionDir, agentId)
@@ -77,7 +84,7 @@ export async function runAgent(opts: {
     appendAgentLog(agentDir, `Inbox provisioned: ${inboxId}`)
   } catch (err) {
     fail(`Inbox provisioning failed: ${err}`)
-    return
+    return { retryHistory: [], toolsUsed: [], profileHit: false }
   }
 
   // --- INBOX_READY ---
@@ -86,6 +93,7 @@ export async function runAgent(opts: {
 
   // Load profile hints for this url/scenario
   const profile = await loadProfile(config.results_dir, url, 'signup')
+  const profileHit = profile !== null && profile !== undefined
 
   // --- SIGNING_UP: launch browser and execute initial task ---
   transition('SIGNING_UP', { currentMessage: initialMessage, startedAt: Date.now() })
@@ -118,12 +126,12 @@ export async function runAgent(opts: {
       } catch (err2) {
         fail(`Browser agent failed after retry: ${err2}`)
         await browserAgent.destroy()
-        return
+        return { retryHistory: browserAgent.exportRetryHistory(), toolsUsed: [], profileHit }
       }
     } else {
       fail(`Browser agent failed: ${err}`)
       await browserAgent.destroy()
-      return
+      return { retryHistory: browserAgent.exportRetryHistory(), toolsUsed: [], profileHit }
     }
   }
 
@@ -205,8 +213,11 @@ export async function runAgent(opts: {
     transition('DONE')
   }
 
+  const retryHistory = browserAgent.exportRetryHistory()
+  const toolsUsed = [...new Set(retryHistory.flatMap(a => a.toolsInjected))]
   await browserAgent.destroy()
   appendAgentLog(agentDir, 'Agent finished')
+  return { retryHistory, toolsUsed, profileHit }
 }
 
 async function generateSummary(

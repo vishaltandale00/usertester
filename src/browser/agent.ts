@@ -33,6 +33,7 @@ export class BrowserAgent {
   private screenshotIndex = 0
   private rlmRecentActions: number
   private rlmMaxFailedActions: number
+  private retryHistory: RetryAttempt[] = []
 
   constructor(opts: {
     config: Partial<UsertesterConfig>
@@ -90,9 +91,13 @@ export class BrowserAgent {
     await this.stagehand.init()
     const page = this.stagehand.context.pages()[0]
 
-    // Inject identity header on all requests so customers can allowlist in Cloudflare WAF:
-    //   (http.request.headers["x-usertester-session"] eq "1") → Skip → Bot Fight Mode
-    await page.setExtraHTTPHeaders({ 'x-usertester-session': '1' })
+    // Inject customer-specific bypass token if configured.
+    // Customers add a WAF rule: (http.request.headers["x-usertester-bypass"] eq "<their-token>") → Skip
+    // The token is secret — read from USERTESTER_BYPASS_TOKEN env, never hardcoded.
+    const bypassToken = this.config.bypass_token
+    if (bypassToken) {
+      await page.setExtraHTTPHeaders({ 'x-usertester-bypass': bypassToken })
+    }
 
     appendAgentLog(this.agentDir, `Browser started. Navigating to ${url}`)
     appendAgentEvent(this.agentDir, { event: 'browser_started', url })
@@ -118,6 +123,7 @@ export class BrowserAgent {
       `Your task: ${initialTask}`,
       `Navigate the app, complete the task, and note anything confusing, broken, or unclear.`,
       `Do not skip steps. Use the email ${inbox} when asked for an email.`,
+      `If verification fails and you need to resend a code, wait for any cooldown timer shown before clicking Resend. Then call readInboxEmail again to get the new code.`,
       hintLines ? `\nKnown context from previous runs:\n${hintLines}` : '',
     ]
       .filter(Boolean)
@@ -125,15 +131,29 @@ export class BrowserAgent {
 
     appendAgentLog(this.agentDir, `Starting task: ${initialTask}`)
 
-    let result = await this.executeTask(systemContext, initialTask)
-    const retryHistory: RetryAttempt[] = []
+    // Pre-inject tools from recovery tip on attempt 1.
+    // The profile's PROVEN APPROACH hint records which tools worked — inject them immediately
+    // so the agent doesn't waste attempt 1 discovering it needs them.
+    const attempt1Tools: Record<string, unknown> = {}
+    const { readInboxEmail } = await import('../tools/inbox.js')
+
+    const provenHint = profileHints?.harnessHints.find(
+      h => h.confidence >= 0.95 && h.observation.startsWith('PROVEN APPROACH'),
+    )
+    if (provenHint?.observation.includes('readInboxEmail')) {
+      attempt1Tools['readInboxEmail'] = readInboxEmail
+      appendAgentLog(this.agentDir, `Pre-injecting readInboxEmail from profile recovery tip`)
+    }
+
+    this.retryHistory = []
+    let result = await this.executeTask(systemContext, initialTask, attempt1Tools)
 
     if (!result.completed) {
       for (let attempt = 2; attempt <= 5; attempt++) {
         const classification = await classifyFailure(result.message, this.config)
         appendAgentLog(this.agentDir, `Retry ${attempt}: classified as ${classification.type} — ${classification.recoveryHint}`)
 
-        retryHistory.push({
+        this.retryHistory.push({
           attempt: attempt - 1,
           instruction: initialTask,
           toolsInjected: [],
@@ -145,6 +165,17 @@ export class BrowserAgent {
 
         if (classification.type === 'COMPLETE') break
         if (classification.type === 'ESCALATE') break
+
+        // RATE_LIMITED: wait the app's specified cooldown then retry
+        if (classification.type === 'RATE_LIMITED') {
+          const secondsMatch = result.message.match(/only request this after (\d+)|wait (\d+) second/i)
+          const waitSeconds = secondsMatch
+            ? parseInt(secondsMatch[1] ?? secondsMatch[2], 10)
+            : 90  // default to 90s if we can't parse
+          appendAgentLog(this.agentDir, `  Rate limited — waiting ${waitSeconds}s before retry`)
+          await new Promise(r => setTimeout(r, waitSeconds * 1000))
+        }
+
         // ENVIRONMENT_BLOCK: only break if no solver tool available for it
         if (classification.type === 'ENVIRONMENT_BLOCK') {
           const recoveryTools = selectToolsForRecovery(classification)
@@ -153,7 +184,7 @@ export class BrowserAgent {
         if (classification.type === 'TRANSIENT' && attempt > 3) break
 
         const tools = selectToolsForRecovery(classification)
-        const retryInstruction = buildRetryInstruction(initialTask, retryHistory, this.memory, url)
+        const retryInstruction = buildRetryInstruction(initialTask, this.retryHistory, this.memory, url)
 
         appendAgentLog(this.agentDir, `  injecting tools: ${Object.keys(tools).join(', ') || 'none'}`)
         result = await this.executeTask(systemContext, retryInstruction, tools)
@@ -163,7 +194,7 @@ export class BrowserAgent {
           const tip: RecoveryTip = {
             url: this.memory.startUrl,
             scenario: 'signup',
-            failedApproaches: retryHistory
+            failedApproaches: this.retryHistory
               .filter(a => a.result === 'failed')
               .map(a => a.agentMessage.slice(0, 150)),
             successApproach: result.message.slice(0, 400),
@@ -198,6 +229,10 @@ export class BrowserAgent {
 
   exportMemory(): SessionMemory {
     return { ...this.memory, actions: [...this.memory.actions] }
+  }
+
+  exportRetryHistory(): RetryAttempt[] {
+    return [...this.retryHistory]
   }
 
   async destroy(): Promise<void> {

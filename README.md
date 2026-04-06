@@ -114,17 +114,26 @@ usertester injects an `x-usertester-session: 1` header on every request. Configu
 
 ### Option A: Cloudflare WAF bypass (recommended, free)
 
-In Cloudflare dashboard → **Security → WAF → Custom rules → Create rule**:
+**Step 1 — Generate a secret bypass token:**
+```bash
+openssl rand -hex 24   # → e.g. a3f9c2b8d7e14f6a9c2b8d7e14f6a9c2b8d7e14f
+```
 
+**Step 2 — Add it to your `.env`:**
+```
+USERTESTER_BYPASS_TOKEN=a3f9c2b8d7e14f6a9c2b8d7e14f6a9c2b8d7e14f
+```
+
+**Step 3 — Add a WAF rule in Cloudflare dashboard → Security → WAF → Custom rules:**
 ```
 Field:      Request Header
-Header:     x-usertester-session
+Header:     x-usertester-bypass
 Operator:   equals
-Value:      1
+Value:      a3f9c2b8d7e14f6a9c2b8d7e14f6a9c2b8d7e14f   ← your secret
 Action:     Skip → All remaining custom rules
 ```
 
-This bypasses Turnstile and Bot Fight Mode for usertester traffic only. Takes 2 minutes.
+The token is never in source code — only in your `.env` and Cloudflare dashboard. Rotate it anytime by generating a new one and updating both places.
 
 ### Option B: Supabase Auth — use Cloudflare test keys
 
