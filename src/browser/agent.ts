@@ -78,15 +78,34 @@ export class BrowserAgent {
       ?? process.env.OPENROUTER_API_KEY
       ?? ''
 
-    this.stagehand = new Stagehand({
-      env: 'LOCAL',
-      verbose: 0,
-      model: { modelName: stagehandModelName, apiKey } as any,
-      localBrowserLaunchOptions: { headless: true },
-      logger: () => {},
-      experimental: true,
-      disableAPI: true,
-    })
+    const useBrowserbase = !!(
+      this.config.browserbase_api_key && this.config.browserbase_project_id
+    )
+
+    if (useBrowserbase) {
+      appendAgentLog(this.agentDir, `Using Browserbase (project: ${this.config.browserbase_project_id})`)
+      this.stagehand = new Stagehand({
+        env: 'BROWSERBASE',
+        apiKey: this.config.browserbase_api_key,
+        projectId: this.config.browserbase_project_id,
+        verbose: 0,
+        model: { modelName: stagehandModelName, apiKey } as any,
+        logger: () => {},
+        experimental: true,
+        disableAPI: true,
+      } as any)
+    } else {
+      appendAgentLog(this.agentDir, `Using local Chrome (headless)`)
+      this.stagehand = new Stagehand({
+        env: 'LOCAL',
+        verbose: 0,
+        model: { modelName: stagehandModelName, apiKey } as any,
+        localBrowserLaunchOptions: { headless: true },
+        logger: () => {},
+        experimental: true,
+        disableAPI: true,
+      })
+    }
 
     await this.stagehand.init()
     const page = this.stagehand.context.pages()[0]

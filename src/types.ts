@@ -108,6 +108,8 @@ export interface UsertesterConfig {
   openai_api_key?: string
   /** Customer-specific secret for Cloudflare WAF bypass. Never hardcoded — read from env only. */
   bypass_token?: string
+  browserbase_api_key?: string
+  browserbase_project_id?: string
   cua_backend: 'stagehand'
   max_agents: number
   cua_concurrency_limit: number
@@ -127,6 +129,8 @@ export const DEFAULT_CONFIG: UsertesterConfig = {
   openrouter_api_key: process.env.OPENROUTER_API_KEY,
   openai_api_key: process.env.OPENAI_API_KEY,
   bypass_token: process.env.USERTESTER_BYPASS_TOKEN,
+  browserbase_api_key: process.env.BROWSERBASE_API_KEY,
+  browserbase_project_id: process.env.BROWSERBASE_PROJECT_ID,
   cua_backend: 'stagehand',
   max_agents: 20,
   cua_concurrency_limit: 5,
