@@ -110,11 +110,15 @@ export class BrowserAgent {
     await this.stagehand.init()
     const page = this.stagehand.context.pages()[0]
 
-    // Inject customer-specific bypass token if configured.
-    // Customers add a WAF rule: (http.request.headers["x-usertester-bypass"] eq "<their-token>") → Skip
-    // The token is secret — read from USERTESTER_BYPASS_TOKEN env, never hardcoded.
+    // Inject WAF bypass token via setExtraHTTPHeaders (LOCAL mode only).
+    // In Browserbase mode, skip — Browserbase handles bot detection independently.
+    // WARNING: setExtraHTTPHeaders applies to ALL requests including cross-domain API
+    // calls. Apps that make credentialed cross-domain fetch calls must add
+    // 'x-usertester-bypass' to their CORS Access-Control-Allow-Headers, otherwise
+    // preflights will fail. Proper per-domain scoping requires Playwright route() which
+    // Stagehand v3 CDP does not expose — tracked as a known limitation.
     const bypassToken = this.config.bypass_token
-    if (bypassToken) {
+    if (bypassToken && !useBrowserbase) {
       await page.setExtraHTTPHeaders({ 'x-usertester-bypass': bypassToken })
     }
 
