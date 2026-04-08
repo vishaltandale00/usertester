@@ -1,0 +1,19 @@
+{
+  "name": "usertester",
+  "version": "0.2.0",
+  "description": "Spawn N AI agents as simulated users to test web app flows — signup, onboarding, checkout — in parallel with real email inboxes.",
+  "author": {
+    "name": "Vishal Tandale"
+  },
+  "homepage": "https://github.com/vishaltandale00/usertester#readme",
+  "repository": "https://github.com/vishaltandale00/usertester",
+  "license": "MIT",
+  "keywords": [
+    "testing",
+    "ai-agents",
+    "browser-automation",
+    "user-testing",
+    "qa",
+    "e2e-testing"
+  ]
+}
