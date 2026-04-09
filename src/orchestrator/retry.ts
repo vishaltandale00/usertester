@@ -22,6 +22,7 @@ export type FailureType =
   | 'WRONG_APPROACH'
   | 'CAPABILITY_GAP'
   | 'ENVIRONMENT_BLOCK'
+  | 'STEP_LIMIT_EXHAUSTED'
   | 'ESCALATE'
 
 export interface FailureClassification {
@@ -166,6 +167,19 @@ export function buildRetryInstruction(
         `Task: ${originalInstruction}`,
       ].join('\n')
     }
+  }
+
+  // --- Step-limit: just continue where you left off ---
+  const lastAttempt = history[history.length - 1]
+  if (lastAttempt?.failureType === 'STEP_LIMIT_EXHAUSTED') {
+    return [
+      `Continue the task from where you left off. The browser is still open.`,
+      currentUrl ? `Current URL: ${currentUrl}` : '',
+      ``,
+      `Original task: ${originalInstruction}`,
+      ``,
+      `You already made progress. Do NOT start over — pick up from the current page state and finish the remaining steps.`,
+    ].filter(Boolean).join('\n')
   }
 
   // --- Fallback: accumulate failure constraints (existing behavior) ---

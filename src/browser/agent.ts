@@ -27,6 +27,7 @@ const ARCHIVE_BATCH = 10
 
 export class BrowserAgent {
   private stagehand: Stagehand | null = null
+  private stagehandOpts: Record<string, any> | null = null
   private config: Partial<UsertesterConfig>
   private memory: SessionMemory
   private agentDir: string
@@ -34,6 +35,8 @@ export class BrowserAgent {
   private rlmRecentActions: number
   private rlmMaxFailedActions: number
   private retryHistory: RetryAttempt[] = []
+  private lastKnownUrl = ''
+  private useBrowserbase = false
 
   constructor(opts: {
     config: Partial<UsertesterConfig>
@@ -78,13 +81,13 @@ export class BrowserAgent {
       ?? process.env.OPENROUTER_API_KEY
       ?? ''
 
-    const useBrowserbase = !!(
+    this.useBrowserbase = !!(
       this.config.browserbase_api_key && this.config.browserbase_project_id
     )
 
-    if (useBrowserbase) {
+    if (this.useBrowserbase) {
       appendAgentLog(this.agentDir, `Using Browserbase (project: ${this.config.browserbase_project_id})`)
-      this.stagehand = new Stagehand({
+      this.stagehandOpts = {
         env: 'BROWSERBASE',
         apiKey: this.config.browserbase_api_key,
         projectId: this.config.browserbase_project_id,
@@ -93,10 +96,10 @@ export class BrowserAgent {
         logger: () => {},
         experimental: true,
         disableAPI: true,
-      } as any)
+      }
     } else {
       appendAgentLog(this.agentDir, `Using local Chrome (headless)`)
-      this.stagehand = new Stagehand({
+      this.stagehandOpts = {
         env: 'LOCAL',
         verbose: 0,
         model: { modelName: stagehandModelName, apiKey } as any,
@@ -104,11 +107,12 @@ export class BrowserAgent {
         logger: () => {},
         experimental: true,
         disableAPI: true,
-      })
+      }
     }
 
+    this.stagehand = new Stagehand(this.stagehandOpts as any)
     await this.stagehand.init()
-    const page = this.stagehand.context.pages()[0]
+    const page = await this.ensureContext()
 
     // Inject WAF bypass token via setExtraHTTPHeaders (LOCAL mode only).
     // In Browserbase mode, skip — Browserbase handles bot detection independently.
@@ -118,7 +122,7 @@ export class BrowserAgent {
     // preflights will fail. Proper per-domain scoping requires Playwright route() which
     // Stagehand v3 CDP does not expose — tracked as a known limitation.
     const bypassToken = this.config.bypass_token
-    if (bypassToken && !useBrowserbase) {
+    if (bypassToken && !this.useBrowserbase) {
       await page.setExtraHTTPHeaders({ 'x-usertester-bypass': bypassToken })
     }
 
@@ -126,6 +130,7 @@ export class BrowserAgent {
     appendAgentEvent(this.agentDir, { event: 'browser_started', url })
 
     await page.goto(url, { waitUntil: 'load' })
+    this.lastKnownUrl = url
 
     // Build initial system context including profile hints.
     // If a high-confidence recovery tip exists (proven approach), use it exclusively —
@@ -172,8 +177,12 @@ export class BrowserAgent {
     let result = await this.executeTask(systemContext, initialTask, attempt1Tools)
 
     if (!result.completed) {
+      const maxSteps = (this.config as any).max_steps ?? 35
       for (let attempt = 2; attempt <= 5; attempt++) {
-        const classification = await classifyFailure(result.message, this.config)
+        // Fast-path: if we used all steps without completing, it's step-limit exhaustion
+        const classification = (result.stepsUsed >= maxSteps && !result.completed)
+          ? { type: 'STEP_LIMIT_EXHAUSTED' as const, evidence: `Used ${result.stepsUsed}/${maxSteps} steps`, recoveryHint: 'Continue from where you left off — the browser is still open.' }
+          : await classifyFailure(result.message, this.config)
         appendAgentLog(this.agentDir, `Retry ${attempt}: classified as ${classification.type} — ${classification.recoveryHint}`)
 
         this.retryHistory.push({
@@ -188,6 +197,7 @@ export class BrowserAgent {
 
         if (classification.type === 'COMPLETE') break
         if (classification.type === 'ESCALATE') break
+        // STEP_LIMIT_EXHAUSTED is always retriable — never break early
 
         // RATE_LIMITED: wait the app's specified cooldown then retry
         if (classification.type === 'RATE_LIMITED') {
@@ -265,10 +275,54 @@ export class BrowserAgent {
     }
   }
 
+  // --- Private: reconnect guard ---
+
+  /**
+   * Returns the current page, re-initializing Stagehand if the browser context
+   * has been invalidated (e.g. Browserbase session timeout during WAITING).
+   */
+  private async ensureContext(): Promise<any> {
+    if (!this.stagehand) throw new Error('Stagehand not initialized')
+
+    try {
+      const ctx = this.stagehand.context
+      if (ctx) {
+        const pages = ctx.pages()
+        if (pages && pages.length > 0) return pages[0] as any
+      }
+    } catch {
+      // context is dead — fall through to reconnect
+    }
+
+    // Reconnect: close stale handle, re-init, navigate back
+    appendAgentLog(this.agentDir, `Browser context lost — reconnecting...`)
+    try { await this.stagehand.close() } catch {}
+
+    if (!this.stagehandOpts) throw new Error('No stagehand config saved — cannot reconnect')
+
+    this.stagehand = new Stagehand(this.stagehandOpts as any)
+    await this.stagehand.init()
+    const page = this.stagehand.context.pages()[0] as any
+
+    // Restore bypass header in LOCAL mode
+    const bypassToken = this.config.bypass_token
+    if (bypassToken && !this.useBrowserbase) {
+      await page.setExtraHTTPHeaders({ 'x-usertester-bypass': bypassToken })
+    }
+
+    if (this.lastKnownUrl) {
+      appendAgentLog(this.agentDir, `Navigating back to ${this.lastKnownUrl}`)
+      await page.goto(this.lastKnownUrl, { waitUntil: 'load' })
+    }
+
+    appendAgentLog(this.agentDir, `Reconnected successfully`)
+    return page
+  }
+
   // --- Private: RLM context builder ---
 
   private async buildRLMContext(nextTask: string): Promise<string> {
-    const page = this.stagehand!.context.pages()[0]
+    const page = await this.ensureContext()
     const currentUrl = page.url()
 
     const recentWindow = this.memory.actions.slice(-this.rlmRecentActions)
@@ -325,12 +379,13 @@ export class BrowserAgent {
     systemContext: string,
     task: string,
     tools: Record<string, unknown> = {},
-  ): Promise<{ completed: boolean; message: string; finalUrl: string }> {
+  ): Promise<{ completed: boolean; message: string; finalUrl: string; stepsUsed: number }> {
     if (!this.stagehand) throw new Error('Stagehand not initialized')
 
-    const page = this.stagehand.context.pages()[0]
+    const page = await this.ensureContext()
     const startUrl = page.url()
     const fullInstruction = systemContext ? `${systemContext}\n\nTask: ${task}` : task
+    const maxSteps = (this.config as any).max_steps ?? 35
 
     try {
       // Tools are passed to stagehand.agent() config, not to execute()
@@ -339,7 +394,24 @@ export class BrowserAgent {
         agentConfig.tools = tools
       }
       const agent = this.stagehand.agent(agentConfig as Parameters<typeof this.stagehand.agent>[0])
-      const result = await agent.execute({ instruction: fullInstruction, maxSteps: 15 })
+      const executeTimeoutMs = (this.config as any).execute_timeout_ms ?? 480_000
+
+      // Wrap in Promise.race with hard timeout. Stagehand's agent.execute() has no internal
+      // timeout — when Browserbase invalidates a session mid-call, it hangs forever. On
+      // timeout we force-close stagehand so the next ensureContext() reconnects from scratch.
+      let timeoutHandle: NodeJS.Timeout | null = null
+      const result = await Promise.race([
+        agent.execute({ instruction: fullInstruction, maxSteps }),
+        new Promise<never>((_, reject) => {
+          timeoutHandle = setTimeout(() => {
+            appendAgentLog(this.agentDir, `agent.execute() exceeded ${executeTimeoutMs / 1000}s — forcing stagehand close to abort hung CDP call`)
+            this.stagehand?.close().catch(() => {})
+            reject(new Error(`Execute timeout after ${executeTimeoutMs / 1000}s — Browserbase session likely expired`))
+          }, executeTimeoutMs)
+        }),
+      ]).finally(() => {
+        if (timeoutHandle) clearTimeout(timeoutHandle)
+      })
 
       await page.waitForLoadState('load').catch(() => {})
       const newUrl = page.url()
@@ -369,13 +441,28 @@ export class BrowserAgent {
         url: startUrl,
       })
 
-      return { completed: result.completed, message: result.message ?? '', finalUrl: newUrl }
+      this.lastKnownUrl = newUrl
+      return { completed: result.completed, message: result.message ?? '', finalUrl: newUrl, stepsUsed: result.actions?.length ?? 0 }
     } catch (err) {
       appendAgentLog(this.agentDir, `agent.execute() failed: ${err}`)
 
+      // After timeout/force-close, observe() and page methods may throw — that's OK,
+      // the next executeTask() will trigger ensureContext() to reconnect.
+      const isTimeout = String(err).includes('Execute timeout')
+      if (isTimeout) {
+        this.recordAction({
+          ts: Date.now(),
+          action: task.slice(0, 100),
+          result: 'failed',
+          observation: String(err),
+          url: this.lastKnownUrl,
+        })
+        return { completed: false, message: String(err), finalUrl: this.lastKnownUrl, stepsUsed: 0 }
+      }
+
       // Fallback: individual act() calls per observed action
       let allActions: Array<{ description: string; selector?: string }> = []
-      try { allActions = await this.stagehand.observe() } catch {}
+      try { allActions = this.stagehand ? await this.stagehand.observe() : [] } catch {}
 
       if (allActions.length > 0) {
         appendAgentLog(this.agentDir, `Falling back to ${allActions.length} individual act() calls`)
@@ -413,7 +500,10 @@ export class BrowserAgent {
         })
       }
 
-      return { completed: false, message: String(err), finalUrl: page.url() }
+      let endUrl = this.lastKnownUrl
+      try { endUrl = page.url() } catch {}
+      this.lastKnownUrl = endUrl
+      return { completed: false, message: String(err), finalUrl: endUrl, stepsUsed: 0 }
     }
   }
 
@@ -442,7 +532,7 @@ export class BrowserAgent {
     const screenshotPath = path.join(screenshotDir, filename)
 
     try {
-      const page = this.stagehand.context.pages()[0]
+      const page = await this.ensureContext()
       await page.screenshot({ path: screenshotPath })
       appendAgentLog(this.agentDir, `Screenshot saved: ${filename}`)
     } catch (err) {

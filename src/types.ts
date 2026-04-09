@@ -121,6 +121,8 @@ export interface UsertesterConfig {
   orchestrator_model: string   // cheap model: summaries, RLM, classifier
   cua_model: string            // browser execution (Stagehand)
   proposer_model: string       // outer harness loop
+  max_steps: number            // max Stagehand agent steps per executeTask() call
+  execute_timeout_ms: number   // hard timeout for a single agent.execute() call
 }
 
 export const DEFAULT_CONFIG: UsertesterConfig = {
@@ -148,4 +150,6 @@ export const DEFAULT_CONFIG: UsertesterConfig = {
   proposer_model: process.env.OPENROUTER_API_KEY
     ? 'openrouter/anthropic/claude-opus-4-6'
     : 'anthropic/claude-opus-4-6',
+  max_steps: 35,
+  execute_timeout_ms: 480_000,  // 8 min — long enough for 35 steps, short enough to detect Browserbase session timeout
 }
