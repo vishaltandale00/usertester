@@ -268,6 +268,15 @@ export class BrowserAgent {
     return [...this.retryHistory]
   }
 
+  /**
+   * Lightweight CDP ping to prevent Browserbase from killing the session
+   * after 10 minutes of inactivity. Called during WAITING state polling.
+   */
+  async heartbeat(): Promise<void> {
+    const page = await this.ensureContext()
+    await page.evaluate(() => undefined)
+  }
+
   async destroy(): Promise<void> {
     if (this.stagehand) {
       await this.stagehand.close()

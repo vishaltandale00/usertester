@@ -15,6 +15,7 @@ export function registerSpawn(program: Command): void {
     .option('--message <message>', 'Task message for all agents')
     .option('--messages-file <file>', 'JSON file with per-agent messages')
     .option('--session <id>', 'Resume an existing session ID')
+    .option('--no-wait', 'Skip WAITING state — agents transition straight to DONE after task completion')
     .action(async (opts) => {
       const config = { ...DEFAULT_CONFIG }
 
@@ -53,6 +54,6 @@ export function registerSpawn(program: Command): void {
       // Ensure results dir exists
       fs.mkdirSync(config.results_dir, { recursive: true })
 
-      await orchestrate({ url: opts.url, messages, n, config })
+      await orchestrate({ url: opts.url, messages, n, config, noWait: !!opts.noWait })
     })
 }

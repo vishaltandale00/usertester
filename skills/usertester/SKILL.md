@@ -57,7 +57,7 @@ Optional but useful:
 ### 1. Spawn agents
 
 ```bash
-usertester spawn --url https://app.example.com --n 3 --message "Sign up as a new user and complete onboarding"
+usertester spawn --url https://app.example.com --n 3 --no-wait --message "Sign up as a new user and complete onboarding"
 ```
 
 Flags:
@@ -66,6 +66,7 @@ Flags:
 - `--message <text>` — task all agents share
 - `--messages-file <path>` — JSON array of `{ "message": "..." }` for per-agent tasks
 - `--session <id>` — resume an existing session
+- `--no-wait` — skip WAITING state; agents go straight to DONE after task completion. **Use this for one-shot tasks where you don't plan to send follow-up commands.** Omit it when you want to use the `usertester send` flow for multi-step user journeys.
 
 The command streams NDJSON to stdout, one event per line. Parse it line by line to know what's happening:
 
@@ -167,7 +168,7 @@ usertester harness run            # analyze recent sessions, propose patches
 
 ### "Test if a new user can sign up"
 ```bash
-usertester spawn --url https://app.example.com --n 1 --message "Sign up as a new user. Complete email verification if required. Report whether you reached the dashboard."
+usertester spawn --url https://app.example.com --n 1 --no-wait --message "Sign up as a new user. Complete email verification if required. Report whether you reached the dashboard."
 ```
 
 ### "Spawn 3 agents to test the full signup → upgrade → cancel flow"
@@ -181,7 +182,7 @@ usertester send agent-01 "Cancel the subscription and confirm the downgrade"
 
 ### "Find any obvious bugs on this URL"
 ```bash
-usertester spawn --url https://app.example.com --n 3 --messages-file - <<'EOF'
+usertester spawn --url https://app.example.com --n 3 --no-wait --messages-file - <<'EOF'
 [
   { "message": "Sign up as a new user and try every menu item on the dashboard" },
   { "message": "Sign up, then try to break the form by entering invalid data" },

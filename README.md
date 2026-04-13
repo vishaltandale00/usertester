@@ -78,6 +78,7 @@ npx usertester setup
 ```bash
 usertester setup                              # First-run API key configuration
 usertester spawn --url URL --n N --message M  # Spawn N agents with a shared task
+usertester spawn --url URL --no-wait --message M      # One-shot: agents exit immediately after task
 usertester spawn --url URL --messages-file tasks.json  # Per-agent tasks from file
 usertester status                             # Show all agents + current state
 usertester send <agent-id> <message>          # Resume a waiting agent with a new task

@@ -1,6 +1,6 @@
 {
   "name": "usertester",
-  "version": "0.3.0",
+  "version": "0.4.0",
   "description": "Spawn N AI agents as simulated users to test web app flows",
   "author": "Vishal Tandale",
   "license": "MIT",

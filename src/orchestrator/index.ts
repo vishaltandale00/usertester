@@ -15,8 +15,9 @@ export async function orchestrate(opts: {
   messages: string[]    // one per agent (cycled if fewer than n)
   n: number
   config: UsertesterConfig
+  noWait?: boolean
 }): Promise<void> {
-  const { url, messages, n, config } = opts
+  const { url, messages, n, config, noWait } = opts
 
   const sessionId = crypto.randomBytes(4).toString('hex')
   const agentIds = Array.from({ length: n }, (_, i) => `agent-${String(i + 1).padStart(2, '0')}`)
@@ -64,6 +65,7 @@ export async function orchestrate(opts: {
           state,
           onStateChange,
           getState,
+          noWait,
         })
           .then(result => {
             agentResults[currentIndex] = result

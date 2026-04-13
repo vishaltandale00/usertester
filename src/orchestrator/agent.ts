@@ -46,6 +46,7 @@ export async function runAgent(opts: {
   state: SessionState
   onStateChange: (newState: SessionState) => void
   getState: () => SessionState
+  noWait?: boolean
 }): Promise<AgentResult> {
   const { agentId, sessionId, url, initialMessage, config } = opts
   const sessionDir = path.join(config.results_dir, sessionId)
@@ -161,56 +162,76 @@ export async function runAgent(opts: {
     updateProfile(config.results_dir, url, 'signup', memory).catch(() => {})
   }
 
-  // --- WAITING: poll for commands ---
-  const commandsPath = path.join(agentDir, 'commands.ndjson')
-  const timeoutAt = Date.now() + config.agent_timeout_ms
+  // --- --no-wait: skip WAITING, go straight to DONE ---
+  if (opts.noWait) {
+    appendAgentLog(agentDir, '--no-wait: skipping WAITING state, transitioning to DONE')
+    transition('DONE')
+  } else {
+    // --- WAITING: poll for commands ---
+    const commandsPath = path.join(agentDir, 'commands.ndjson')
+    const timeoutAt = Date.now() + config.agent_timeout_ms
+    const HEARTBEAT_INTERVAL_MS = 240_000  // 4 min — keeps Browserbase CDP alive (10 min timeout)
+    let lastHeartbeat = Date.now()
 
-  while (Date.now() < timeoutAt) {
-    const agentState = opts.getState().agents.find(a => a.id === agentId)
-    if (!agentState || agentState.status === 'CANCELLED' || agentState.status === 'DONE') break
+    while (Date.now() < timeoutAt) {
+      const agentState = opts.getState().agents.find(a => a.id === agentId)
+      if (!agentState || agentState.status === 'CANCELLED' || agentState.status === 'DONE') break
 
-    const cmd = readPendingCommand(commandsPath)
+      const cmd = readPendingCommand(commandsPath)
 
-    if (cmd?.type === 'kill') {
-      appendAgentLog(agentDir, 'Received kill command')
-      transition('CANCELLED')
-      break
-    }
-
-    if (cmd?.type === 'send' && cmd.message) {
-      const message = cmd.message
-      appendAgentLog(agentDir, `Received send command: ${message}`)
-      transition('RUNNING', { currentMessage: message })
-
-      try {
-        const result = await browserAgent.resume(message)
-        emitEvent({
-          event: 'ready',
-          agent: agentId,
-          message_completed: message,
-          summary: result.summary,
-          screenshot: result.screenshotPath,
-          ts: ts(),
-        })
-        transition('WAITING')
-        updateProfile(config.results_dir, url, 'signup', browserAgent.exportMemory()).catch(() => {})
-      } catch (err) {
-        fail(`Resume failed: ${err}`)
+      if (cmd?.type === 'kill') {
+        appendAgentLog(agentDir, 'Received kill command')
+        transition('CANCELLED')
         break
       }
 
-      continue
+      if (cmd?.type === 'send' && cmd.message) {
+        const message = cmd.message
+        appendAgentLog(agentDir, `Received send command: ${message}`)
+        transition('RUNNING', { currentMessage: message })
+
+        try {
+          const result = await browserAgent.resume(message)
+          emitEvent({
+            event: 'ready',
+            agent: agentId,
+            message_completed: message,
+            summary: result.summary,
+            screenshot: result.screenshotPath,
+            ts: ts(),
+          })
+          transition('WAITING')
+          lastHeartbeat = Date.now()  // reset heartbeat timer after activity
+          updateProfile(config.results_dir, url, 'signup', browserAgent.exportMemory()).catch(() => {})
+        } catch (err) {
+          fail(`Resume failed: ${err}`)
+          break
+        }
+
+        continue
+      }
+
+      // CDP heartbeat: keep Browserbase session alive during idle WAITING
+      if (Date.now() - lastHeartbeat >= HEARTBEAT_INTERVAL_MS) {
+        try {
+          await browserAgent.heartbeat()
+          lastHeartbeat = Date.now()
+          appendAgentLog(agentDir, 'CDP heartbeat sent')
+        } catch {
+          appendAgentLog(agentDir, 'CDP heartbeat failed — browser context may be dead')
+        }
+      }
+
+      // No command — wait
+      await new Promise(r => setTimeout(r, COMMAND_POLL_MS))
     }
 
-    // No command — wait
-    await new Promise(r => setTimeout(r, COMMAND_POLL_MS))
-  }
-
-  // Timeout → DONE
-  const finalState = opts.getState().agents.find(a => a.id === agentId)
-  if (finalState?.status === 'WAITING') {
-    appendAgentLog(agentDir, 'Session timeout — transitioning to DONE')
-    transition('DONE')
+    // Timeout → DONE
+    const finalState = opts.getState().agents.find(a => a.id === agentId)
+    if (finalState?.status === 'WAITING') {
+      appendAgentLog(agentDir, 'Session timeout — transitioning to DONE')
+      transition('DONE')
+    }
   }
 
   const retryHistory = browserAgent.exportRetryHistory()
